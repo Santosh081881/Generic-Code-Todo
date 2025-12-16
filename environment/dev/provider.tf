@@ -6,8 +6,8 @@ terraform {
     }
   }
   backend "azurerm" {
-    resource_group_name  = "sonu_rg"
-    storage_account_name = "sonustorage2"
+    resource_group_name  = "rg-santu"
+    storage_account_name = "santustorage"
     container_name       = "tfstate"
     key                  = "genric.terraform.tfstate"
   }
