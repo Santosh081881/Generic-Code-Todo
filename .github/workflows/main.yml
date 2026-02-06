@@ -1,0 +1,786 @@
+name: Terraform Module CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - feature/*
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: 'Run integration tests (creates real resources)'
+        required: true
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  issues: write
+  security-events: write
+
+# Prevent duplicate runs: only one workflow per PR/branch at a time
+# Use head_ref for PRs (same for push and PR events), ref for direct pushes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-provider:
+    name: Detect Cloud Provider
+    runs-on: ubuntu-latest
+    outputs:
+      provider: ${{ steps.detect.outputs.provider }}
+      examples: ${{ steps.detect.outputs.examples }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect Provider and Examples
+        id: detect
+        run: |
+          echo "🔍 Detecting cloud provider from module files..."
+
+          # Check versions.tf for provider
+          if [ -f "versions.tf" ]; then
+            if grep -q "azurerm" versions.tf; then
+              PROVIDER="azure"
+              echo "☁️  Detected Azure provider"
+            elif grep -q "google" versions.tf; then
+              PROVIDER="gcp"
+              echo "☁️  Detected GCP provider"
+            elif grep -q "aws" versions.tf; then
+              PROVIDER="aws"
+              echo "☁️  Detected AWS provider"
+            else
+              PROVIDER="multi-cloud"
+              echo "☁️  Multi-cloud or provider-agnostic module"
+            fi
+          else
+            PROVIDER="unknown"
+            echo "⚠️  No versions.tf found, assuming provider-agnostic"
+          fi
+
+          echo "provider=${PROVIDER}" >> $GITHUB_OUTPUT
+          echo "✅ Provider: ${PROVIDER}"
+
+          # Detect available examples
+          EXAMPLES=""
+          if [ -d "tftest/example" ]; then
+            EXAMPLES="example"
+          fi
+
+          echo "examples=${EXAMPLES}" >> $GITHUB_OUTPUT
+          echo "📁 Available examples: ${EXAMPLES}"
+
+  checkov-scan:
+    name: Checkov Security Scan
+    needs: detect-provider
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+          output_format: cli,json
+          output_file_path: console,checkov-results.json
+
+      - name: Upload Checkov Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-results-${{ github.run_number }}
+          path: checkov-results.json
+
+  tflint-scan:
+    name: TFLint Linter Scan
+    needs: detect-provider
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Initialize TFLint
+        run: |
+          echo "Initializing TFLint..."
+          tflint --init
+
+      - name: Run TFLint on Module
+        run: |
+          echo "Running TFLint on module..."
+          tflint --format=json --force > tflint-module-results.json || true
+          tflint --format=compact || true
+
+      - name: Run TFLint on Examples
+        run: |
+          echo "Running TFLint on examples..."
+          for example in tftest/*/; do
+            if [ -d "$example" ]; then
+              echo "Linting $example"
+              (cd "$example" && tflint --init && tflint --format=compact) || true
+            fi
+          done
+
+      - name: Upload TFLint Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: tflint-results-${{ github.run_number }}
+          path: tflint-module-results.json
+
+  detect-secrets-scan:
+    name: Detect Secrets Scan
+    needs: detect-provider
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog Scan (PR)
+        if: github.event_name == 'pull_request'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --only-verified
+
+      - name: Run TruffleHog Scan (Push - Last Commit)
+        if: github.event_name == 'push'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.before }}
+          head: ${{ github.sha }}
+          extra_args: --only-verified
+
+      - name: Run TruffleHog Scan (Full Scan for Workflow Dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          extra_args: --only-verified
+
+  terratest:
+    name: Terratest Validation
+    needs: detect-provider
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: test/go.mod
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Configure Azure OIDC
+        if: needs.detect-provider.outputs.provider == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ### The GCP OIDC configuration is commented out to avoid redundancy with the Terraform Validate step.
+      # - name: Configure GCP OIDC
+      #   if: needs.detect-provider.outputs.provider == 'gcp'
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Create GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_APP_IAC_ID }}
+          private-key: ${{ secrets.GH_APP_IAC_PEM }}
+          owner: U*****r-IaC-Core
+
+      - name: Configure Git to use GitHub App token
+        run: |
+           git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+
+        ### Added service Account credentials for GCP Terraform validation
+      - name: Configure GCP OIDC
+        if: needs.detect-provider.outputs.provider == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GOOGLE_CREDENTIALS }}
+
+      - name: Download Go dependencies
+        working-directory: test
+        run: |
+          echo "📦 Downloading Go dependencies..."
+          go mod download
+          go mod verify
+
+      - name: Run Terratest
+        working-directory: test
+        run: |
+          echo "🧪 Running Terratest..."
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "🚀 PR: Running INTEGRATION tests (apply + destroy)"
+            echo "⚠️  Creating real cloud resources"
+            go test -v -timeout 30m 2>&1 | tee terratest-results.txt
+            echo "✅ Integration tests completed"
+          elif [ "${{ inputs.run_tests }}" = "true" ]; then
+            echo "🚀 Manual integration test"
+            go test -v -timeout 30m 2>&1 | tee terratest-results.txt
+          else
+            echo "📋 Feature branch: Plan-only validation"
+            echo "💡 No resources created"
+            go test -v -short -timeout 15m 2>&1 | tee terratest-results.txt
+            echo "✅ Plan validation completed"
+          fi
+
+      - name: Upload Terratest Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terratest-results-${{ github.run_number }}
+          path: test/terratest-results.txt
+          retention-days: 30
+
+      - name: Terratest Summary
+        if: always()
+        run: |
+          echo "## 🧪 Terratest Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Provider:** ${{ needs.detect-provider.outputs.provider }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Examples Tested:** ${{ needs.detect-provider.outputs.examples }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f test/terratest-results.txt ]; then
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            tail -n 20 test/terratest-results.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  update-terraform-docs:
+    name: Update Terraform Documentation
+    needs: [detect-provider]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Create GitHub App Token for Module Access
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GH_APP_IAC_ID }}
+          private-key: ${{ secrets.GH_APP_IAC_PEM }}
+          owner: Unilever-IaC-Core
+
+      - name: Configure Git for private modules
+        run: |
+          git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      - name: Terraform Init for Docs
+        run: |
+          echo "🔧 Initializing Terraform to generate documentation..."
+          terraform init -backend=false
+
+      - name: Ensure README Has TF_DOCS Tags
+        run: |
+          if [ ! -f "README.md" ]; then
+            echo "⚠️  README.md not found, will be created"
+          fi
+          if ! grep -q "<!-- BEGIN_TF_DOCS -->" README.md 2>/dev/null; then
+            echo "<!-- BEGIN_TF_DOCS -->" >> README.md
+            echo "<!-- END_TF_DOCS -->" >> README.md
+            echo "✅ Added missing TF_DOCS tags"
+          fi
+
+      - name: Generate Module Documentation
+        uses: terraform-docs/gh-actions@v1.2.0
+        with:
+          working-dir: .
+          output-file: README.md
+          output-method: inject
+          git-push: false
+          config-file: .terraform-docs.yml
+
+      - name: Ensure Example README Has TF_DOCS Tags
+        if: contains(needs.detect-provider.outputs.examples, 'example')
+        run: |
+          README_PATH="tftest/example/README.md"
+          if [ ! -f "$README_PATH" ]; then
+            echo "# Example" > "$README_PATH"
+            echo "" >> "$README_PATH"
+          fi
+          if ! grep -q "<!-- BEGIN_TF_DOCS -->" "$README_PATH" 2>/dev/null; then
+            echo "" >> "$README_PATH"
+            echo "<!-- BEGIN_TF_DOCS -->" >> "$README_PATH"
+            echo "<!-- END_TF_DOCS -->" >> "$README_PATH"
+            echo "✅ Added missing TF_DOCS tags to example README"
+          fi
+
+      - name: Terraform Init for Example Docs
+        if: contains(needs.detect-provider.outputs.examples, 'example')
+        working-directory: tftest/example
+        run: |
+          echo "🔧 Initializing example Terraform..."
+          terraform init -backend=false
+          echo "✅ Example terraform init completed"
+
+      - name: Generate Example Docs
+        if: contains(needs.detect-provider.outputs.examples, 'example')
+        uses: terraform-docs/gh-actions@v1.2.0
+        with:
+          working-dir: tftest/example
+          output-file: README.md
+          output-method: inject
+          git-push: false
+          config-file: .terraform-docs.yml
+
+      - name: Fix file permissions after Docker
+        run: |
+          sudo chown -R $USER:$USER .git .
+          sudo chmod -R u+rwX .git
+
+      - name: Debug Example README Changes
+        if: contains(needs.detect-provider.outputs.examples, 'example')
+        run: |
+          echo "🔍 Checking example README.md status..."
+          if [ -f "tftest/example/README.md" ]; then
+            echo "✅ Example README.md exists"
+            echo "📄 File size: $(wc -l < tftest/example/README.md) lines"
+            echo "🔍 Git status for example README:"
+            git status tftest/example/README.md
+            echo "🔍 Git diff for example README:"
+            git diff tftest/example/README.md | head -n 50
+          else
+            echo "⚠️  Example README.md not found!"
+          fi
+
+      - name: Check for documentation changes
+        id: docs-check
+        run: |
+          # Check both staged and unstaged changes
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "📝 No documentation changes detected"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "📝 Documentation changes detected"
+            git diff --stat
+            git diff --cached --stat
+          fi
+
+      - name: Configure Git User
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and Push Documentation Updates
+        if: steps.docs-check.outputs.has_changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "📝 Changes detected, committing..."
+            git add README.md tftest/*/README.md
+            git commit -m "docs: auto-update terraform documentation"
+
+            # Update remote URL to use GITHUB_TOKEN for push
+            git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+            git push origin HEAD:${{ github.ref_name }}
+            echo "✅ Documentation updated successfully"
+          else
+            echo "ℹ️  No changes to commit"
+          fi
+
+      - name: Documentation Summary
+        if: always()
+        run: |
+          echo "## 📚 Terraform Documentation Update" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Module:** Updated" >> $GITHUB_STEP_SUMMARY
+          echo "- **Examples:** ${{ needs.detect-provider.outputs.examples }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes:** ${{ steps.docs-check.outputs.has_changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.docs-check.outputs.has_changes }}" == "true" ]; then
+            echo "✅ Documentation has been automatically updated and committed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No documentation updates required" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  create-release:
+    name: Create Release
+    needs: [detect-provider, update-terraform-docs]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Latest Tags
+        run: |
+          echo "🔄 Fetching latest tags from remote..."
+          git fetch --tags --force
+          echo "Latest tags:"
+          git tag --sort=-version:refname | head -5
+
+      - name: Analyze Commits for Release
+        id: analyze
+        run: |
+          echo "📝 Analyzing commits since last release..."
+
+          # Get latest tag by version (not by commit ancestry)
+          LATEST_TAG=$(git tag --sort=-version:refname | head -n 1 || echo "")
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous tags found, checking all commits"
+            COMMITS=$(git log --pretty=format:"%s" origin/main)
+          else
+            echo "Latest tag: $LATEST_TAG"
+
+            # Get the commit that the tag points to (not HEAD of tagged commit)
+            TAG_COMMIT=$(git rev-list -n 1 $LATEST_TAG)
+            echo "Tag commit: $TAG_COMMIT"
+
+            # Get commits AFTER the tag commit on origin/main (this excludes the "chore: release" commit)
+            COMMITS=$(git log ${TAG_COMMIT}..origin/main --pretty=format:"%s")
+
+            echo "Commits since tag:"
+            echo "$COMMITS"
+          fi
+
+          # Check if there are any conventional commits
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits found since last release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Filter out release commits to avoid re-analyzing them
+          FILTERED_COMMITS=$(echo "$COMMITS" | grep -v "^chore: release" | grep -v "^docs: auto-update terraform documentation" || true)
+
+          if [ -z "$FILTERED_COMMITS" ]; then
+            echo "No new feature/fix commits found (only release/docs commits)"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Determine version bump from conventional commits
+          BREAKING=false
+          FEAT=false
+          FIX=false
+
+          while IFS= read -r commit; do
+            # Skip empty lines
+            [ -z "$commit" ] && continue
+
+            if [[ "$commit" =~ ^feat!:|^[a-z]+\!:|BREAKING\ CHANGE ]]; then
+              BREAKING=true
+            elif [[ "$commit" =~ ^feat:|^feat\( ]]; then
+              FEAT=true
+            elif [[ "$commit" =~ ^fix:|^fix\( ]]; then
+              FIX=true
+            fi
+          done <<< "$FILTERED_COMMITS"
+
+          # Determine version bump type
+          if [ "$BREAKING" = true ]; then
+            VERSION_BUMP="major"
+          elif [ "$FEAT" = true ]; then
+            VERSION_BUMP="minor"
+          elif [ "$FIX" = true ]; then
+            VERSION_BUMP="patch"
+          else
+            echo "No conventional commits found (feat, fix, or breaking changes)"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          echo "version_bump=$VERSION_BUMP" >> $GITHUB_OUTPUT
+          echo "🎯 Version bump type: $VERSION_BUMP"
+
+      - name: Calculate New Version
+        if: steps.analyze.outputs.should_release == 'true'
+        id: version
+        run: |
+          # Get latest tag by version (not by commit ancestry)
+          LATEST_TAG=$(git tag --sort=-version:refname | head -n 1 || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+
+          # Remove 'v' prefix
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -ra VER_PARTS <<< "$VERSION"
+
+          MAJOR=${VER_PARTS[0]:-0}
+          MINOR=${VER_PARTS[1]:-0}
+          PATCH=${VER_PARTS[2]:-0}
+
+          # Bump version based on type
+          if [ "${{ steps.analyze.outputs.version_bump }}" = "major" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [ "${{ steps.analyze.outputs.version_bump }}" = "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog
+        if: steps.analyze.outputs.should_release == 'true'
+        id: changelog
+        run: |
+          echo "📝 Generating changelog..."
+
+          LATEST_TAG=$(git tag --sort=-version:refname | head -n 1 || echo "")
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+
+          if [ -z "$LATEST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"%s|||%b" origin/main)
+          else
+            COMMITS=$(git log ${LATEST_TAG}..origin/main --pretty=format:"%s|||%b")
+          fi
+
+          # Generate changelog sections
+          FEATURES=""
+          FIXES=""
+          BREAKING=""
+          OTHER=""
+
+          while IFS='|||' read -r subject body; do
+            # Extract type and scope
+            if [[ "$subject" =~ ^([a-z]+)(\([a-z-]+\))?!?:\ (.+)$ ]]; then
+              TYPE="${BASH_REMATCH[1]}"
+              SCOPE="${BASH_REMATCH[2]}"
+              DESC="${BASH_REMATCH[3]}"
+
+              # Check for breaking change
+              if [[ "$subject" =~ ! ]] || [[ "$body" =~ BREAKING\ CHANGE ]]; then
+                BREAKING="${BREAKING}- 🚨 **BREAKING**: ${DESC}${SCOPE}\n"
+              elif [ "$TYPE" = "feat" ]; then
+                FEATURES="${FEATURES}- ✨ ${DESC}${SCOPE}\n"
+              elif [ "$TYPE" = "fix" ]; then
+                FIXES="${FIXES}- 🐛 ${DESC}${SCOPE}\n"
+              else
+                OTHER="${OTHER}- ${DESC}${SCOPE}\n"
+              fi
+            fi
+          done <<< "$COMMITS"
+
+          # Build changelog (DO NOT use this format, it's only for release notes)
+          CHANGELOG="## ${NEW_VERSION#v} ($(date +%Y-%m-%d))\n\n"
+
+          if [ -n "$BREAKING" ]; then
+            CHANGELOG="${CHANGELOG}### ⚠️ BREAKING CHANGES\n\n${BREAKING}\n"
+          fi
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG="${CHANGELOG}### ✨ Features\n\n${FEATURES}\n"
+          fi
+          if [ -n "$FIXES" ]; then
+            CHANGELOG="${CHANGELOG}### 🐛 Bug Fixes\n\n${FIXES}\n"
+          fi
+          if [ -n "$OTHER" ]; then
+            CHANGELOG="${CHANGELOG}### 📝 Other Changes\n\n${OTHER}\n"
+          fi
+
+          # Save to file
+          echo -e "$CHANGELOG" > /tmp/release_notes.md
+
+          # Show changelog
+          echo "Generated changelog:"
+          cat /tmp/release_notes.md
+
+      - name: Update CHANGELOG.md
+        if: steps.analyze.outputs.should_release == 'true'
+        id: update-changelog
+        continue-on-error: true
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          TODAY=$(date +%Y-%m-%d)
+
+          # Read the changelog sections from release notes file
+          # Skip the first line (header) as we'll create our own with proper format
+          RELEASE_CONTENT=$(cat /tmp/release_notes.md | tail -n +3)
+
+          # Create new changelog entry ONLY in bracket format: [X.Y.Z] - DATE
+          NEW_ENTRY="## [${NEW_VERSION#v}] - ${TODAY}\n${RELEASE_CONTENT}\n"
+
+          # Find line number of [Unreleased] section
+          UNRELEASED_LINE=$(grep -n "^## \[Unreleased\]" CHANGELOG.md | cut -d: -f1)
+
+          if [ -n "$UNRELEASED_LINE" ]; then
+            # Insert after the blank line following [Unreleased]
+            INSERT_LINE=$((UNRELEASED_LINE + 2))
+
+            # Create temporary file with new entry
+            head -n $((INSERT_LINE - 1)) CHANGELOG.md > CHANGELOG.md.tmp
+            echo -e "$NEW_ENTRY" >> CHANGELOG.md.tmp
+            tail -n +$INSERT_LINE CHANGELOG.md >> CHANGELOG.md.tmp
+            mv CHANGELOG.md.tmp CHANGELOG.md
+
+            # Update comparison links at the bottom
+            REPO_URL="https://github.com/U****r-IaC-Core/$(basename $(git rev-parse --show-toplevel))"
+
+            # Find and update the [Unreleased] link, and add new version link
+            if grep -q "^\[Unreleased\]:" CHANGELOG.md; then
+              # Replace [Unreleased] link and add new version link after it
+              sed -i "/^\[Unreleased\]:/c\[Unreleased]: ${REPO_URL}/compare/${NEW_VERSION}...HEAD\n[${NEW_VERSION#v}]: ${REPO_URL}/releases/tag/${NEW_VERSION}" CHANGELOG.md
+            else
+              # Add links if they don't exist
+              echo "" >> CHANGELOG.md
+              echo "[Unreleased]: ${REPO_URL}/compare/${NEW_VERSION}...HEAD" >> CHANGELOG.md
+              echo "[${NEW_VERSION#v}]: ${REPO_URL}/releases/tag/${NEW_VERSION}" >> CHANGELOG.md
+            fi
+
+            echo "✅ Updated CHANGELOG.md with version ${NEW_VERSION}"
+            echo "📄 Preview:"
+            head -n $((INSERT_LINE + 15)) CHANGELOG.md | tail -n 20
+          else
+            echo "⚠️ Could not find [Unreleased] section in CHANGELOG.md"
+            exit 1
+          fi
+
+      - name: Commit CHANGELOG
+        if: steps.analyze.outputs.should_release == 'true' && steps.update-changelog.outcome == 'success'
+        id: commit-changelog
+        continue-on-error: true
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add CHANGELOG.md
+          git commit -m "chore: release ${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push
+
+      - name: Create Git Tag
+        if: steps.analyze.outputs.should_release == 'true'
+        id: create-tag
+        continue-on-error: true
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          TAG="${{ steps.version.outputs.version }}"
+
+          # Fetch latest tags from remote to ensure we have the current state
+          git fetch --tags
+
+          # Check if tag already exists on remote (not just local)
+          if git ls-remote --tags origin | grep -q "refs/tags/$TAG$"; then
+            echo "⚠️  Tag $TAG already exists on remote, skipping"
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "✅ Created and pushed tag: $TAG"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        if: steps.analyze.outputs.should_release == 'true' && steps.create-tag.outputs.tag_exists != 'true'
+        id: create-release
+        continue-on-error: true
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          release_name: Release ${{ steps.version.outputs.version }}
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: false
+
+      - name: Release Summary
+        if: always()
+        run: |
+          echo "## 🏷️ Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.analyze.outputs.should_release }}" == "true" ]; then
+            echo "### Release: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Show status of each step
+            echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Version Calculated | ✅ ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Changelog Generated | ${{ steps.changelog.outcome == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| CHANGELOG.md Updated | ${{ steps.update-changelog.outcome == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Changes Committed | ${{ steps.commit-changelog.outcome == 'success' && '✅' || '⚠️ Skipped' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Git Tag Created | ${{ steps.create-tag.outcome == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| GitHub Release | ${{ steps.create-release.outcome == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            # Show any failures
+            if [ "${{ steps.create-release.outcome }}" != "success" ]; then
+              echo "⚠️ **Some steps failed but process continued**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Recovery:** You can manually:" >> $GITHUB_STEP_SUMMARY
+              echo "1. Check the tag exists: \`git tag | grep ${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+              echo "2. Create release manually from tag in GitHub UI" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ **All steps completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📝 Release Notes" >> $GITHUB_STEP_SUMMARY
+            if [ -f /tmp/release_notes.md ]; then
+              cat /tmp/release_notes.md >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ **No Release:** No conventional commits found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Use conventional commit format to trigger releases:" >> $GITHUB_STEP_SUMMARY
+            echo "- \`feat: description\` for new features (minor bump)" >> $GITHUB_STEP_SUMMARY
+            echo "- \`fix: description\` for bug fixes (patch bump)" >> $GITHUB_STEP_SUMMARY
+            echo "- \`feat!: description\` for breaking changes (major bump)" >> $GITHUB_STEP_SUMMARY
+          fi
